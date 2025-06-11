@@ -279,38 +279,72 @@ static CYTHON_INLINE int __Pyx_PyBytes_Equals(PyObject* s1, PyObject* s2, int eq
 #endif
 }
 
-//////////////////// GetItemIntByteArray.proto ////////////////////
+//////////////////// SetStringIndexingError.proto /////////////////
 
-#define __Pyx_GetItemInt_ByteArray(o, i, type, is_signed, to_py_func, is_list, wraparound, boundscheck) \
+static void __Pyx_SetStringIndexingError(const char* message, int has_gil); /* proto */
+
+//////////////////// SetStringIndexingError /////////////////
+
+static void __Pyx_SetStringIndexingError(const char* message, int has_gil) {
+    if (!has_gil) {
+        PyGILState_STATE gil_state = PyGILState_Ensure();
+        PyErr_SetString(PyExc_IndexError, message);
+        PyGILState_Release(gil_state);
+    } else
+        PyErr_SetString(PyExc_IndexError, message);
+}
+
+//////////////////// GetItemIntByteArray.proto ////////////////////
+//@requires: SetStringIndexingError
+
+#define __Pyx_GetItemInt_ByteArray(o, i, type, is_signed, to_py_func, is_list, wraparound, boundscheck, has_gil) \
     (__Pyx_fits_Py_ssize_t(i, type, is_signed) ? \
-    __Pyx_GetItemInt_ByteArray_Fast(o, (Py_ssize_t)i, wraparound, boundscheck) : \
-    (PyErr_SetString(PyExc_IndexError, "bytearray index out of range"), -1))
+    __Pyx_GetItemInt_ByteArray_Fast(o, (Py_ssize_t)i, wraparound, boundscheck, has_gil) : \
+    (__Pyx_SetStringIndexingError("bytearray index out of range", has_gil), -1))
 
 static CYTHON_INLINE int __Pyx_GetItemInt_ByteArray_Fast(PyObject* string, Py_ssize_t i,
-                                                         int wraparound, int boundscheck);
+                                                         int wraparound, int boundscheck, int has_gil);
 
 //////////////////// GetItemIntByteArray ////////////////////
+//@requires: ModuleSetupCode.c::CriticalSections
+
+static CYTHON_INLINE int __Pyx_GetItemInt_ByteArray_Fast_Locked(PyObject* string, Py_ssize_t i,
+                                                                int wraparound, int boundscheck, int has_gil) {                                             
+    Py_ssize_t length = __Pyx_PyByteArray_GET_SIZE(string);
+    #if !CYTHON_ASSUME_SAFE_SIZE
+    if (unlikely(length < 0)) return -1;
+    #endif
+    if (wraparound & unlikely(i < 0)) i += length;
+    if ((!boundscheck) || likely(__Pyx_is_valid_index(i, length))) {
+        #if !CYTHON_ASSUME_SAFE_MACROS
+        char *asString = PyByteArray_AsString(string);
+        return likely(asString) ? (unsigned char) asString[i] : -1;
+        #else
+        return (unsigned char) (PyByteArray_AS_STRING(string)[i]);
+        #endif
+    } else {
+        __Pyx_SetStringIndexingError("bytearray index out of range", has_gil);
+        return -1;
+    }
+}
 
 static CYTHON_INLINE int __Pyx_GetItemInt_ByteArray_Fast(PyObject* string, Py_ssize_t i,
-                                                         int wraparound, int boundscheck) {
-    Py_ssize_t length;
+                                                         int wraparound, int boundscheck, int has_gil) {
+#if CYTHON_COMPILING_IN_CPYTHON_FREETHREADING
+    // In freethreaded Python, wraparound is expensive because it involves acquiring a lock and maybe also the GIL.
+    // Therefore we skip it if it isn't needed.
+    wraparound = wraparound && i<0;
+#endif
     if (wraparound | boundscheck) {
-        length = __Pyx_PyByteArray_GET_SIZE(string);
-        #if !CYTHON_ASSUME_SAFE_SIZE
-        if (unlikely(length < 0)) return -1;
-        #endif
-        if (wraparound & unlikely(i < 0)) i += length;
-        if ((!boundscheck) || likely(__Pyx_is_valid_index(i, length))) {
-            #if !CYTHON_ASSUME_SAFE_MACROS
-            char *asString = PyByteArray_AsString(string);
-            return likely(asString) ? (unsigned char) asString[i] : -1;
-            #else
-            return (unsigned char) (PyByteArray_AS_STRING(string)[i]);
-            #endif
-        } else {
-            PyErr_SetString(PyExc_IndexError, "bytearray index out of range");
-            return -1;
-        }
+        int result;
+        // What we're guarding here is just that the size isn't mutating from under us.
+        // The aim isn't to make the character read-writes atomic (although practically they probably are).
+        // For simplicity, skip the critical section if we don't have the GIL. It's the user's problem!
+        __Pyx_PyCriticalSection cs;
+        if (has_gil) __Pyx_PyCriticalSection_Begin1(&cs, string);
+        result = __Pyx_GetItemInt_ByteArray_Fast_Locked(string, i, wraparound, boundscheck, has_gil);
+        if (has_gil) __Pyx_PyCriticalSection_End1(&cs);
+        return result;
     } else {
         #if !CYTHON_ASSUME_SAFE_MACROS
         char *asString = PyByteArray_AsString(string);
@@ -323,39 +357,58 @@ static CYTHON_INLINE int __Pyx_GetItemInt_ByteArray_Fast(PyObject* string, Py_ss
 
 
 //////////////////// SetItemIntByteArray.proto ////////////////////
+//@requires: SetStringIndexingError
 
-#define __Pyx_SetItemInt_ByteArray(o, i, v, type, is_signed, to_py_func, is_list, wraparound, boundscheck) \
+#define __Pyx_SetItemInt_ByteArray(o, i, v, type, is_signed, to_py_func, is_list, wraparound, boundscheck, has_gil) \
     (__Pyx_fits_Py_ssize_t(i, type, is_signed) ? \
-    __Pyx_SetItemInt_ByteArray_Fast(o, (Py_ssize_t)i, v, wraparound, boundscheck) : \
-    (PyErr_SetString(PyExc_IndexError, "bytearray index out of range"), -1))
+    __Pyx_SetItemInt_ByteArray_Fast(o, (Py_ssize_t)i, v, wraparound, boundscheck, has_gil) : \
+    (__Pyx_SetStringIndexingError("bytearray index out of range", has_gil), -1))
 
 static CYTHON_INLINE int __Pyx_SetItemInt_ByteArray_Fast(PyObject* string, Py_ssize_t i, unsigned char v,
-                                                         int wraparound, int boundscheck);
+                                                         int wraparound, int boundscheck, int has_gil);
 
 //////////////////// SetItemIntByteArray ////////////////////
+//@requires: ModuleSetupCode.c::CriticalSections
+
+static CYTHON_INLINE int __Pyx_SetItemInt_ByteArray_Fast_Locked(PyObject* string, Py_ssize_t i, unsigned char v,
+                                                                int wraparound, int boundscheck, int has_gil) {
+    Py_ssize_t length = __Pyx_PyByteArray_GET_SIZE(string);
+    #if !CYTHON_ASSUME_SAFE_SIZE
+    if (unlikely(length < 0)) return -1;
+    #endif
+    if (wraparound & unlikely(i < 0)) i += length;
+    if ((!boundscheck) || likely(__Pyx_is_valid_index(i, length))) {
+        #if !CYTHON_ASSUME_SAFE_MACROS
+        char *asString = PyByteArray_AsString(string);
+        if (unlikely(!asString)) return -1;
+        asString[i] = (char)v;
+        #else
+        PyByteArray_AS_STRING(string)[i] = (char) v;
+        #endif
+        return 0;
+    } else {
+        __Pyx_SetStringIndexingError("bytearray index out of range", has_gil);
+        return -1;
+    }
+}
 
 static CYTHON_INLINE int __Pyx_SetItemInt_ByteArray_Fast(PyObject* string, Py_ssize_t i, unsigned char v,
-                                                         int wraparound, int boundscheck) {
-    Py_ssize_t length;
+                                                         int wraparound, int boundscheck, int has_gil) {
+#if CYTHON_COMPILING_IN_CPYTHON_FREETHREADING
+    // In freethreaded Python, wraparound is expensive because it involves acquiring a lock and maybe also the GIL.
+    // Therefore we skip it if it isn't needed.
+    wraparound = wraparound && i<0;
+#endif
     if (wraparound | boundscheck) {
-        length = __Pyx_PyByteArray_GET_SIZE(string);
-        #if !CYTHON_ASSUME_SAFE_SIZE
-        if (unlikely(length < 0)) return -1;
-        #endif
-        if (wraparound & unlikely(i < 0)) i += length;
-        if ((!boundscheck) || likely(__Pyx_is_valid_index(i, length))) {
-            #if !CYTHON_ASSUME_SAFE_MACROS
-            char *asString = PyByteArray_AsString(string);
-            if (unlikely(!asString)) return -1;
-            asString[i] = (char)v;
-            #else
-            PyByteArray_AS_STRING(string)[i] = (char) v;
-            #endif
-            return 0;
-        } else {
-            PyErr_SetString(PyExc_IndexError, "bytearray index out of range");
-            return -1;
-        }
+        int result;
+        // What we're guarding here is just that the size isn't mutating from under us.
+        // The aim isn't to make the character read-writes atomic (although practically they probably are).
+        // For simplicity, skip the critical section if we don't have the GIL. It's the user's problem!
+        __Pyx_PyCriticalSection cs;
+        if (has_gil) __Pyx_PyCriticalSection_Begin1(&cs, string);
+        result = __Pyx_SetItemInt_ByteArray_Fast_Locked(string, i, v, wraparound, boundscheck, has_gil);
+        if (has_gil) __Pyx_PyCriticalSection_End1(&cs);
+        return result;
     } else {
         #if !CYTHON_ASSUME_SAFE_MACROS
         char *asString = PyByteArray_AsString(string);
@@ -370,19 +423,20 @@ static CYTHON_INLINE int __Pyx_SetItemInt_ByteArray_Fast(PyObject* string, Py_ss
 
 
 //////////////////// GetItemIntUnicode.proto ////////////////////
+//@requires: SetStringIndexingError
 
-#define __Pyx_GetItemInt_Unicode(o, i, type, is_signed, to_py_func, is_list, wraparound, boundscheck) \
+#define __Pyx_GetItemInt_Unicode(o, i, type, is_signed, to_py_func, is_list, wraparound, boundscheck, has_gil) \
     (__Pyx_fits_Py_ssize_t(i, type, is_signed) ? \
-    __Pyx_GetItemInt_Unicode_Fast(o, (Py_ssize_t)i, wraparound, boundscheck) : \
-    (PyErr_SetString(PyExc_IndexError, "string index out of range"), (Py_UCS4)-1))
+    __Pyx_GetItemInt_Unicode_Fast(o, (Py_ssize_t)i, wraparound, boundscheck, has_gil) : \
+    (__Pyx_SetStringIndexingError("string index out of range", has_gil), (Py_UCS4)-1))
 
 static CYTHON_INLINE Py_UCS4 __Pyx_GetItemInt_Unicode_Fast(PyObject* ustring, Py_ssize_t i,
-                                                           int wraparound, int boundscheck);
+                                                           int wraparound, int boundscheck, int has_gil);
 
 //////////////////// GetItemIntUnicode ////////////////////
 
 static CYTHON_INLINE Py_UCS4 __Pyx_GetItemInt_Unicode_Fast(PyObject* ustring, Py_ssize_t i,
-                                                           int wraparound, int boundscheck) {
+                                                           int wraparound, int boundscheck, int has_gil) {
     Py_ssize_t length;
     if (unlikely(__Pyx_PyUnicode_READY(ustring) < 0)) return (Py_UCS4)-1;
     if (wraparound | boundscheck) {
@@ -394,7 +448,7 @@ static CYTHON_INLINE Py_UCS4 __Pyx_GetItemInt_Unicode_Fast(PyObject* ustring, Py
         if ((!boundscheck) || likely(__Pyx_is_valid_index(i, length))) {
             return __Pyx_PyUnicode_READ_CHAR(ustring, i);
         } else {
-            PyErr_SetString(PyExc_IndexError, "string index out of range");
+            __Pyx_SetStringIndexingError("string index out of range", has_gil);
             return (Py_UCS4)-1;
         }
     } else {
@@ -1101,7 +1155,7 @@ static CYTHON_INLINE int __Pyx_PyByteArray_AppendObject(PyObject* bytearray, PyO
             ival = 0;
         } else {
             ival = __Pyx_PyLong_CompactValue(value);
-            if (unlikely(ival > 255)) goto bad_range;
+            if (unlikely(!__Pyx_is_valid_index(ival, 256))) goto bad_range;
         }
     } else
 #endif
@@ -1114,7 +1168,7 @@ static CYTHON_INLINE int __Pyx_PyByteArray_AppendObject(PyObject* bytearray, PyO
             goto bad_range;
         }
     }
-    return __Pyx_PyByteArray_Append(bytearray, ival);
+    return __Pyx_PyByteArray_Append(bytearray, (int) ival);
 bad_range:
     PyErr_SetString(PyExc_ValueError, "byte must be in range(0, 256)");
     return -1;
@@ -1135,7 +1189,7 @@ static CYTHON_INLINE int __Pyx_PyByteArray_Append(PyObject* bytearray, int value
         if (likely(n != PY_SSIZE_T_MAX)) {
             if (unlikely(PyByteArray_Resize(bytearray, n + 1) < 0))
                 return -1;
-            PyByteArray_AS_STRING(bytearray)[n] = value;
+            PyByteArray_AS_STRING(bytearray)[n] = (char) (unsigned char) value;
             return 0;
         }
     } else {

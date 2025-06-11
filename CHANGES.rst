@@ -48,7 +48,7 @@ Bugs fixed
 * Includes all fixes as of Cython 3.1.2.
 
 
-3.1.2 (2025-??-??)
+3.1.2 (2025-06-09)
 ==================
 
 Bugs fixed
@@ -60,11 +60,27 @@ Bugs fixed
 * Type checks on or-ed union types could incorrectly return false.
   (Github issue :issue:`6420`)
 
+* Negative list indexing could accidentally wrap around twice in PyPy and the Limited API.
+
 * Iterating over literal sequences with starred (unpacked) items could infer a wrong
   type for the loop variable and fail to assign the values.
   (Github issue :issue:`6924`)
 
-* Avoid including C++11 ``<type_traits>`` unconditionally.
+* Calls to C functions taking exception types failed to check for a `None` argument.
+  (Github issue :issue:`6420`)
+
+* Fused functions had an incorrect ``__module__`` attribute.
+  (Github issue :issue:`6897`)
+
+* The type of Cython implemented functions had an incorrect ``__module__`` attribute.
+  (Github issue :issue:`6841`)
+
+* Errors while indexing into ``bytearray`` or ``str`` in ``nogil`` sections could crash.
+  (Github issue :issue:`6947`)
+
+* ``bytearray.append()`` could silently accept some invalid character numbers.
+
+* The C++11 ``<type_traits>`` header was included regardless of the C++ version.
   (Github issue :issue:`6896`)
 
 * ``PyDict_GetItemStringRef()`` was accidentally used in older Limited API versions.
@@ -73,14 +89,23 @@ Bugs fixed
 * ``abort()`` was used but not always available in the Limited API.
   (Github issue :issue:`6918`)
 
+* Some dependencies were missing from the ``depfile``.
+  (Github issue :issue:`6938`)
+
 * Embedded function signatures were not always separated from the existing docstring.
   (Github issue :issue:`6904`)
+
+* ``numpy.math`` was missing from ``Cython/Includes/`` and could not be cimported.
+  (Github issue :issue:`6859`)
 
 * Some tests were adapted for NumPy 2.x.
   (Github issue :issue:`6898`)
 
 * Some C compiler warnings were fixed.
   (Github issue :issue:`6870`)
+
+* ``Cython.Build`` was not officially exposing the ``cythonize`` function.
+  (Github issue :issue:`6934`)
 
 
 3.1.1 (2025-05-19)

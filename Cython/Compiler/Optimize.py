@@ -186,7 +186,7 @@ class IterationTransform(Visitor.EnvTransform):
                 pos, operator='==', operand1=node.operand1, operand2=target)
             if_body = Nodes.StatListNode(
                 pos,
-                stats = [Nodes.SingleAssignmentNode(pos, lhs=result_ref, rhs=ExprNodes.BoolNode(pos, value=1)),
+                stats = [Nodes.SingleAssignmentNode(pos, lhs=result_ref, rhs=ExprNodes.BoolNode(pos, value=True)),
                          Nodes.BreakStatNode(pos)])
             if_node = Nodes.IfStatNode(
                 pos,
@@ -200,7 +200,8 @@ class IterationTransform(Visitor.EnvTransform):
                     target=target,
                     iterator=ExprNodes.IteratorNode(node.operand2.pos, sequence=node.operand2),
                     body=if_node,
-                    else_clause=Nodes.SingleAssignmentNode(pos, lhs=result_ref, rhs=ExprNodes.BoolNode(pos, value=0))))
+                    else_clause=Nodes.SingleAssignmentNode(
+                        pos, lhs=result_ref, rhs=ExprNodes.BoolNode(pos, value=False))))
             for_loop = for_loop.analyse_expressions(self.current_env())
             for_loop = self.visit(for_loop)
             new_node = UtilNodes.TempResultFromStatNode(result_ref, for_loop)
@@ -372,35 +373,87 @@ class IterationTransform(Visitor.EnvTransform):
 
     def _transform_indexable_iteration(self, node, slice_node, is_mutable, reversed=False):
         """In principle can handle any iterable that Cython has a len() for and knows how to index"""
+        # Generates code that looks approximately like:
+        #
+        # done = False
+        # index = 0
+        # while not done:
+        #    with critical_section(iterable):
+        #        if index > len(iterable):
+        #            done = True
+        #            continue
+        #        value = iterable[index]
+        #    ...
+        #    index += 1
+        # else:
+        #     ...
+        #
+        # with small adjustments for reverse iteration and non-mutable sequences.
         unpack_temp_node = UtilNodes.LetRefNode(
             slice_node.as_none_safe_node("'NoneType' is not iterable"),
             may_hold_none=False, is_temp=True
             )
 
+        length_call_node = ExprNodes.SimpleCallNode(
+            node.pos,
+            function=ExprNodes.NameNode(
+                node.pos, name="len",
+                entry=Builtin.builtin_scope.lookup("len")),
+            args=[unpack_temp_node])
+        if is_mutable:
+            end_node = length_call_node
+        else:
+            end_node = UtilNodes.LetRefNode(length_call_node, type=PyrexTypes.c_py_ssize_t_type)
         start_node = ExprNodes.IntNode(
             node.pos, value='0', constant_result=0, type=PyrexTypes.c_py_ssize_t_type)
-        def make_length_call():
-            # helper function since we need to create this node for a couple of places
-            builtin_len = ExprNodes.NameNode(node.pos, name="len",
-                                             entry=Builtin.builtin_scope.lookup("len"))
-            return ExprNodes.SimpleCallNode(node.pos,
-                                    function=builtin_len,
-                                    args=[unpack_temp_node]
-                                    )
-        length_temp = UtilNodes.LetRefNode(make_length_call(), type=PyrexTypes.c_py_ssize_t_type, is_temp=True)
-        end_node = length_temp
+        keep_going_ref = UtilNodes.LetRefNode(ExprNodes.BoolNode(node.pos, value=True))
 
         if reversed:
             relation1, relation2 = '>', '>='
-            start_node, end_node = end_node, start_node
+            start_check_node, end_node = end_node, start_node
+            start_node = ExprNodes.SubNode(
+                node.pos,
+                operator='-',
+                operand1=copy.copy(start_check_node),
+                operand2=ExprNodes.IntNode(node.pos, value="1", constant_result=1, type=PyrexTypes.c_py_ssize_t_type))
         else:
+            start_check_node = copy.copy(start_node)
             relation1, relation2 = '<=', '<'
 
-        counter_ref = UtilNodes.LetRefNode(pos=node.pos, type=PyrexTypes.c_py_ssize_t_type)
+        counter_ref = UtilNodes.LetRefNode(start_node, type=PyrexTypes.c_py_ssize_t_type)
+
+        test_node = ExprNodes.PrimaryCmpNode(
+            node.pos,
+            operator=relation2,
+            operand1=counter_ref,
+            operand2=end_node)
+        if is_mutable and reversed:
+            test_node = ExprNodes.BoolBinopNode(
+                node.pos,
+                operator="and",
+                operand1=test_node,
+                operand2=ExprNodes.PrimaryCmpNode(
+                    node.pos,
+                    operator=relation1,
+                    operand1=start_check_node,
+                    operand2=counter_ref,
+                )
+            )
+        failed_test_body = Nodes.StatListNode(
+            node.pos,
+            stats=[
+                # set "done" to true and continue. This'll terminate the loop and trigger the else clause
+                Nodes.SingleAssignmentNode(
+                    node.pos,
+                    lhs=keep_going_ref,
+                    rhs=ExprNodes.BoolNode(node.pos, value=False)
+                ),
+                Nodes.ContinueStatNode(node.pos)
+            ]
+        )
 
         target_value = ExprNodes.IndexNode(slice_node.pos, base=unpack_temp_node,
                                            index=counter_ref)
-
         target_assign = Nodes.SingleAssignmentNode(
             pos = node.target.pos,
             lhs = node.target,
@@ -416,43 +469,60 @@ class IterationTransform(Visitor.EnvTransform):
             body=target_assign,
         )
 
+        length_check_and_target_assign = Nodes.IfStatNode(
+            node.pos,
+            if_clauses=[
+                Nodes.IfClauseNode(
+                    node.pos,
+                    condition=test_node,
+                    body=target_assign
+                ),
+            ],
+            else_clause=failed_test_body)
+
+        if is_mutable:
+            assert slice_node.type.is_pyobject, slice_node.type
+            # For mutable containers, the size can change underneath us.
+            # In freethreaded builds we need to lock around the length check and the indexing.
+            length_check_and_target_assign = Nodes.CriticalSectionStatNode(
+                node.pos,
+                args=[unpack_temp_node],
+                body=length_check_and_target_assign
+            )
+            length_check_and_target_assign.analyse_declarations(env)  # sets up "finally_except_clause"
         body = Nodes.StatListNode(
             node.pos,
-            stats = [target_assign])  # exclude node.body for now to not reanalyse it
-        if is_mutable:
-            # We need to be slightly careful here that we are actually modifying the loop
-            # bounds and not a temp copy of it. Setting is_temp=True on length_temp seems
-            # to ensure this.
-            # If this starts to fail then we could insert an "if out_of_bounds: break" instead
-            loop_length_reassign = Nodes.SingleAssignmentNode(node.pos,
-                                                        lhs = length_temp,
-                                                        rhs = make_length_call())
-            body.stats.append(loop_length_reassign)
-
-        loop_node = Nodes.ForFromStatNode(
-            node.pos,
-            bound1=start_node, relation1=relation1,
-            target=counter_ref,
-            relation2=relation2, bound2=end_node,
-            step=None, body=body,
-            else_clause=node.else_clause,
-            from_range=True)
-
-        ret = UtilNodes.LetNode(
-                    unpack_temp_node,
-                    UtilNodes.LetNode(
-                        length_temp,
-                        # TempResultFromStatNode provides the framework where the "counter_ref"
-                        # temp is set up and can be assigned to. However, we don't need the
-                        # result it returns so wrap it in an ExprStatNode.
-                        Nodes.ExprStatNode(node.pos,
-                            expr=UtilNodes.TempResultFromStatNode(
-                                    counter_ref,
-                                    loop_node
-                            )
-                        )
+            stats = [
+                length_check_and_target_assign,
+                # exclude node.body for now to not reanalyse it
+                Nodes.SingleAssignmentNode(
+                    node.pos,
+                    lhs=counter_ref,
+                    rhs=ExprNodes.binop_node(
+                        node.pos,
+                        operator="-" if reversed else "+",
+                        inplace=True,
+                        operand1=counter_ref,
+                        operand2=ExprNodes.IntNode(node.pos, value="1", constant_result=1, type=PyrexTypes.c_py_ssize_t_type)
                     )
-                ).analyse_expressions(env)
+                )
+            ])
+
+        loop_node = Nodes.WhileStatNode(
+            node.pos,
+            condition = keep_going_ref,
+            body = body,
+            else_clause = node.else_clause,
+        )
+
+        ret = loop_node
+        # temps that are assigned once on entry to the loop
+        for let_ref_node in [unpack_temp_node, keep_going_ref, counter_ref] + (
+                [end_node] if not is_mutable else []):
+            ret = UtilNodes.LetNode(let_ref_node, ret)
+
+        ret = ret.analyse_expressions(env)
+        # Reinsert loop body after analysing the rest.
         body.stats.insert(1, node.body)
         return ret
 
@@ -1391,8 +1461,8 @@ class SwitchTransform(Visitor.EnvTransform):
 
         return self.build_simple_switch_statement(
             node, common_var, conditions, not_in,
-            ExprNodes.BoolNode(node.pos, value=True, constant_result=True),
-            ExprNodes.BoolNode(node.pos, value=False, constant_result=False))
+            ExprNodes.BoolNode(node.pos, value=True),
+            ExprNodes.BoolNode(node.pos, value=False))
 
     def visit_PrimaryCmpNode(self, node):
         if not self.current_directives.get('optimize.use_switch'):
@@ -1409,8 +1479,8 @@ class SwitchTransform(Visitor.EnvTransform):
 
         return self.build_simple_switch_statement(
             node, common_var, conditions, not_in,
-            ExprNodes.BoolNode(node.pos, value=True, constant_result=True),
-            ExprNodes.BoolNode(node.pos, value=False, constant_result=False))
+            ExprNodes.BoolNode(node.pos, value=True),
+            ExprNodes.BoolNode(node.pos, value=False))
 
     def build_simple_switch_statement(self, node, common_var, conditions,
                                       not_in, true_val, false_val):
@@ -1489,7 +1559,7 @@ class FlattenInListTransform(Visitor.VisitorTransform, SkipDeclarations):
             # note: lhs may have side effects, but ".is_simple()" may not work yet before type analysis.
             if lhs.try_is_simple():
                 constant_result = node.operator == 'not_in'
-                return ExprNodes.BoolNode(node.pos, value=constant_result, constant_result=constant_result)
+                return ExprNodes.BoolNode(node.pos, value=constant_result)
             return node
 
         if any([arg.is_starred for arg in args]):
@@ -1829,12 +1899,12 @@ class EarlyReplaceBuiltinCalls(Visitor.EnvTransform):
                     condition=condition,
                     body=Nodes.ReturnStatNode(
                         node.pos,
-                        value=ExprNodes.BoolNode(yield_expression.pos, value=is_any, constant_result=is_any))
+                        value=ExprNodes.BoolNode(yield_expression.pos, value=is_any))
                 )]
         )
         loop_node.else_clause = Nodes.ReturnStatNode(
             node.pos,
-            value=ExprNodes.BoolNode(yield_expression.pos, value=not is_any, constant_result=not is_any))
+            value=ExprNodes.BoolNode(yield_expression.pos, value=not is_any))
 
         Visitor.recursively_replace_node(gen_expr_node, yield_stat_node, test_node)
 
@@ -2724,9 +2794,7 @@ class OptimizeBuiltinCalls(Visitor.NodeRefCleanupMixin,
         """Transform bool(x) into a type coercion to a boolean.
         """
         if len(pos_args) == 0:
-            return ExprNodes.BoolNode(
-                node.pos, value=False, constant_result=False
-                ).coerce_to(Builtin.bool_type, self.current_env())
+            return ExprNodes.BoolNode(node.pos, value=False, type=Builtin.bool_type)
         elif len(pos_args) != 1:
             self._error_wrong_arg_count('bool', node, pos_args, '0 or 1')
             return node
@@ -4226,9 +4294,7 @@ class OptimizeBuiltinCalls(Visitor.NodeRefCleanupMixin,
     def _inject_bint_default_argument(self, node, args, arg_index, default_value):
         assert len(args) >= arg_index
         if len(args) == arg_index:
-            default_value = bool(default_value)
-            args.append(ExprNodes.BoolNode(node.pos, value=default_value,
-                                           constant_result=default_value))
+            args.append(ExprNodes.BoolNode(node.pos, value=bool(default_value)))
         else:
             args[arg_index] = args[arg_index].coerce_to_boolean(self.current_env())
 
@@ -4281,12 +4347,12 @@ def optimise_numeric_binop(operator, node, ret_type, arg0, arg1):
         numval.pos, value=numval.value, constant_result=numval.constant_result,
         type=num_type))
     inplace = node.inplace if isinstance(node, ExprNodes.NumBinopNode) else False
-    extra_args.append(ExprNodes.BoolNode(node.pos, value=inplace, constant_result=inplace))
+    extra_args.append(ExprNodes.BoolNode(node.pos, value=inplace))
     if is_float or operator not in ('Eq', 'Ne'):
         # "PyFloatBinop" and "PyLongBinop" take an additional "check for zero division" argument.
         zerodivision_check = arg_order == 'CObj' and (
             not node.cdivision if isinstance(node, ExprNodes.DivNode) else False)
-        extra_args.append(ExprNodes.BoolNode(node.pos, value=zerodivision_check, constant_result=zerodivision_check))
+        extra_args.append(ExprNodes.BoolNode(node.pos, value=zerodivision_check))
 
     utility_code = TempitaUtilityCode.load_cached(
         "PyFloatBinop" if is_float else "PyLongCompare" if operator in ('Eq', 'Ne') else "PyLongBinop",
@@ -4374,8 +4440,7 @@ class ConstantFolding(Visitor.VisitorTransform, SkipDeclarations):
             return None
 
     def _bool_node(self, node, value):
-        value = bool(value)
-        return ExprNodes.BoolNode(node.pos, value=value, constant_result=value)
+        return ExprNodes.BoolNode(node.pos, value=bool(value))
 
     def visit_ExprNode(self, node):
         self._calculate_const(node)
@@ -4511,14 +4576,12 @@ class ConstantFolding(Visitor.VisitorTransform, SkipDeclarations):
                 new_node.type = PyrexTypes.py_object_type
             else:
                 new_node.type = PyrexTypes.widest_numeric_type(widest_type, new_node.type)
+        elif target_class is ExprNodes.BoolNode:
+            new_node = ExprNodes.BoolNode(node.pos, value=node.constant_result, type=widest_type)
         else:
-            if target_class is ExprNodes.BoolNode:
-                node_value = node.constant_result
-            else:
-                node_value = str(node.constant_result)
-            new_node = target_class(pos=node.pos, type = widest_type,
-                                    value = node_value,
-                                    constant_result = node.constant_result)
+            new_node = target_class(pos=node.pos, type=widest_type,
+                                    value=str(node.constant_result),
+                                    constant_result=node.constant_result)
         return new_node
 
     def visit_AddNode(self, node):
